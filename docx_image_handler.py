@@ -160,6 +160,19 @@ class DOCXImageHandler:
             doc_path, encoding="UTF-8", xml_declaration=True, pretty_print=True
         )
 
+        # Ensure <Default Extension="png"...> etc. exists
+        ct_path = os.path.join(extract_dir, "[Content_Types].xml")
+        ct_tree = etree.parse(ct_path)
+        ct_root = ct_tree.getroot()
+        ext_exists = any(
+            el.get("Extension") == "png" for el in ct_root.findall("{*}Default")
+        )
+        if not ext_exists:
+            default = etree.SubElement(ct_root, "Default")
+            default.set("Extension", "png")
+            default.set("ContentType", "image/png")
+        ct_tree.write(ct_path, encoding="UTF-8", xml_declaration=True)
+
     def _insert_image_at_marker(
         self,
         doc_root,
@@ -169,38 +182,42 @@ class DOCXImageHandler:
         height: int,
         description: str,
     ):
-        """Insert image XML at marker location"""
-        ns = self.namespaces
+        """
+        Insert an image immediately after the *first* occurrence of `marker`
+        (even if that marker is split across multiple runs).
+        """
 
-        # Find text nodes containing the marker
-        for text_elem in doc_root.iter(f'{{{ns["w"]}}}t'):
-            if text_elem.text and marker in text_elem.text:
-                # Find the run and paragraph
-                run = text_elem.getparent()
-                while run is not None and run.tag != f'{{{ns["w"]}}}r':
-                    run = run.getparent()
+        ns_w = self.namespaces["w"]
 
-                if run is not None:
-                    para = run.getparent()
-                    while para is not None and para.tag != f'{{{ns["w"]}}}p':
-                        para = para.getparent()
+        # Walk every paragraph once – cheaper than scanning all <w:t> nodes individually
+        for para in doc_root.iter(f"{{{ns_w}}}p"):
+            # Build the full, contiguous paragraph text
+            texts = [t.text or "" for t in para.iter(f"{{{ns_w}}}t")]
+            full_txt = "".join(texts)
 
-                    if para is not None:
-                        # Create image XML
-                        image_xml = self._create_image_xml(
-                            rel_id, width, height, description
-                        )
+            if marker not in full_txt:
+                continue  # no marker in this paragraph – next!
 
-                        # Create new run for image
-                        new_run = etree.Element(f'{{{ns["w"]}}}r')
-                        new_run.append(image_xml)
+            # ---------- 1. remove the marker text from all runs ----------
+            remaining = full_txt.replace(marker, "")
+            # Clear existing runs
+            for r in list(para.findall(f"{{{ns_w}}}r")):
+                para.remove(r)
 
-                        # Insert after current run
-                        run_index = list(para).index(run)
-                        para.insert(run_index + 1, new_run)
+            # Re-add the paragraph text (without marker) in ONE run
+            r_new_txt = etree.SubElement(para, f"{{{ns_w}}}r")
+            t_elem = etree.SubElement(r_new_txt, f"{{{ns_w}}}t")
+            if remaining.startswith(" ") or remaining.endswith(" "):
+                t_elem.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            t_elem.text = remaining
 
-                        # Remove marker from text
-                        text_elem.text = text_elem.text.replace(marker, "")
+            # ---------- 2. drop in the image run right after ----------
+            img_run = etree.Element(f"{{{ns_w}}}r")
+            img_run.append(self._create_image_xml(rel_id, width, height, description))
+            para.append(img_run)
+
+            # Only insert once per document (remove `return` if you want every marker)
+            return
 
     def _create_image_xml(self, rel_id: str, width: int, height: int, description: str):
         """Create the image XML structure"""

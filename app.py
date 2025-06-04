@@ -3,6 +3,7 @@ import re
 import base64
 import logging
 import os
+import json  # Added for image handling
 from typing import Dict, List, Optional, BinaryIO
 from dataclasses import dataclass
 from enum import Enum
@@ -672,10 +673,19 @@ class DOCXFormatterAPI:
         self.app.route("/format-with-images", methods=["POST"])(
             self.format_with_images_endpoint
         )  # New endpoint
+        self.app.route("/format-with-images-download", methods=["POST"])(
+            self.format_with_images_download_endpoint
+        )  # NEW download endpoint
         self.app.route("/test-doc", methods=["GET"])(self.create_test_document)
         self.app.route("/test-images", methods=["GET"])(
             self.test_images_endpoint
         )  # New endpoint
+        self.app.route("/test-doc-markers", methods=["POST"])(
+            self.test_document_markers_endpoint
+        )  # NEW debug endpoint
+        self.app.route("/test-json-structure", methods=["POST"])(
+            self.test_json_structure_endpoint
+        )  # NEW JSON test endpoint
         self.app.route("/test-format", methods=["GET"])(self.test_format_endpoint)
         self.app.route("/test-linebreaks", methods=["GET"])(
             self.test_linebreaks_endpoint
@@ -727,25 +737,113 @@ class DOCXFormatterAPI:
         """Format document with images from AI response - NEW ENDPOINT"""
         logger.info("Received formatting request with images")
 
+        # Check Content-Type
+        content_type = request.headers.get("Content-Type", "")
+        if not content_type.startswith("application/json"):
+            logger.warning(
+                f"Invalid Content-Type for /format-with-images: {content_type}"
+            )
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Content-Type must be application/json",
+                        "hint": "Set header 'Content-Type: application/json' and send JSON body",
+                    }
+                ),
+                415,
+            )
+
         try:
             # Get JSON data from request
             data = request.get_json()
 
             if not data:
-                return abort(400, "Request must contain JSON data")
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "message": "Request body must be valid JSON",
+                            "example": {
+                                "body": {
+                                    "$content": "base64_encoded_docx_content",
+                                    "$content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    "images": [
+                                        {
+                                            "marker": "IMAGE_ID",
+                                            "data": "base64_encoded_image",
+                                            "format": "png",
+                                            "width": 400,
+                                            "height": 300,
+                                            "description": "Image description",
+                                        }
+                                    ],
+                                }
+                            },
+                        }
+                    ),
+                    400,
+                )
+
+            # Debug logging
+            logger.debug(f"Received data keys: {list(data.keys())}")
+            if "body" in data:
+                logger.debug(f"Body keys: {list(data['body'].keys())}")
+                if "images" in data["body"]:
+                    logger.debug(
+                        f"Number of images in body: {len(data['body']['images'])}"
+                    )
 
             # Extract document and images
-            doc_content = data.get("document")
-            images = data.get("images", [])
+            # Support multiple formats for flexibility
+            doc_content = None
+            images = []
+
+            # Format 1: Body structure with images inside body (NEW FORMAT)
+            if "body" in data and isinstance(data["body"], dict):
+                doc_content = data["body"].get("$content")
+                images = data["body"].get("images", [])
+            elif "document" in data:  # legacy support
+                doc_content = data.get("document")
+                images = data.get("images", [])
+
+            if not images and "images" in data:  # <- add these two lines
+                images = data["images"]  # <-
 
             if not doc_content:
-                return abort(400, "Missing 'document' field in request")
+                return abort(
+                    400, "Missing document content in body.$content or document"
+                )
+
+            if not doc_content:
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "message": "Missing document content",
+                            "hint": "Provide document in 'body.$content' field",
+                            "example": {
+                                "body": {
+                                    "$content": "base64_encoded_docx",
+                                    "images": [{"marker": "...", "data": "..."}],
+                                }
+                            },
+                        }
+                    ),
+                    400,
+                )
 
             # Decode document content
             if isinstance(doc_content, str):
                 doc_bytes = base64.b64decode(doc_content)
             else:
                 doc_bytes = doc_content
+
+            # Log where we found the data
+            if "body" in data and "images" in data.get("body", {}):
+                logger.info(f"Found images in body.images: {len(images)} images")
+            else:
+                logger.info(f"Found images at root level: {len(images)} images")
 
             # First, format the document for text markers
             input_stream = io.BytesIO(doc_bytes)
@@ -755,9 +853,16 @@ class DOCXFormatterAPI:
             # Then, add images if any
             if images:
                 logger.info(f"Processing {len(images)} images")
+                # Log the image markers for debugging
+                for img in images:
+                    logger.info(
+                        f"Image marker: {img.get('marker')}, format: {img.get('format')}, size: {img.get('width')}x{img.get('height')}"
+                    )
+
                 result_bytes = self.image_handler.add_images_to_docx(
                     formatted_bytes, images
                 )
+                logger.info("Image processing completed")
             else:
                 result_bytes = formatted_bytes
 
@@ -780,6 +885,114 @@ class DOCXFormatterAPI:
         except Exception as e:
             logger.error(f"Unexpected error: {e}", exc_info=True)
             return jsonify({"status": "error", "message": "Internal server error"}), 500
+
+    def format_with_images_download_endpoint(self):
+        """
+        Download endpoint for format-with-images - returns file directly
+        Use this endpoint to save the response as a file instead of getting JSON
+        """
+        logger.info("Received formatting request with images (download mode)")
+
+        # Check Content-Type
+        content_type = request.headers.get("Content-Type", "")
+        if not content_type.startswith("application/json"):
+            logger.warning(
+                f"Invalid Content-Type for /format-with-images-download: {content_type}"
+            )
+            return abort(415, "Content-Type must be application/json")
+
+        try:
+            # Get JSON data from request
+            data = request.get_json()
+
+            if not data:
+                return abort(400, "Request body must be valid JSON")
+
+            # Debug logging
+            logger.debug(f"Received data keys: {list(data.keys())}")
+            if "body" in data:
+                logger.debug(f"Body keys: {list(data['body'].keys())}")
+                if "images" in data["body"]:
+                    logger.debug(
+                        f"Number of images in body: {len(data['body']['images'])}"
+                    )
+
+            # Extract document and images
+            # Support multiple formats for flexibility
+            doc_content = None
+            images = []
+
+            # Format 1: Body structure with images inside body (NEW FORMAT)
+            if "body" in data and isinstance(data["body"], dict):
+                doc_content = data["body"].get("$content")
+                images = data["body"].get("images", [])
+            elif "document" in data:  # legacy support
+                doc_content = data.get("document")
+                images = data.get("images", [])
+
+            if not images and "images" in data:  # <- add these two lines
+                images = data["images"]  # <-
+
+            if not doc_content:
+                return abort(
+                    400, "Missing document content in body.$content or document"
+                )
+
+            # Decode document content
+            if isinstance(doc_content, str):
+                doc_bytes = base64.b64decode(doc_content)
+            else:
+                doc_bytes = doc_content
+
+            # Log where we found the data
+            if "body" in data and "images" in data.get("body", {}):
+                logger.info(f"Found images in body.images: {len(images)} images")
+            else:
+                logger.info(f"Found images at root level: {len(images)} images")
+
+            # First, format the document for text markers
+            input_stream = io.BytesIO(doc_bytes)
+            formatted_stream = self.formatter.format_document(input_stream)
+            formatted_bytes = formatted_stream.read()
+
+            # Then, add images if any
+            if images:
+                logger.info(f"Processing {len(images)} images")
+                # Log the image markers for debugging
+                for img in images:
+                    logger.info(
+                        f"Image marker: {img.get('marker')}, format: {img.get('format')}, size: {img.get('width')}x{img.get('height')}"
+                    )
+
+                result_bytes = self.image_handler.add_images_to_docx(
+                    formatted_bytes, images
+                )
+                logger.info("Image processing completed")
+            else:
+                result_bytes = formatted_bytes
+
+            # Create output stream
+            output_stream = io.BytesIO(result_bytes)
+            output_stream.seek(0)
+
+            logger.info(
+                f"Formatting completed with {len(images)} images (download mode)"
+            )
+
+            # Return as downloadable file
+            return send_file(
+                output_stream,
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                as_attachment=True,
+                download_name="formatted_document_with_images.docx",
+            )
+
+        except ValueError as ve:
+            logger.error(f"Formatting error: {ve}")
+            return abort(400, str(ve))
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return abort(500, "Internal server error during document processing")
 
     def format_download_endpoint(self):
         """
@@ -904,6 +1117,173 @@ class DOCXFormatterAPI:
             as_attachment=True,
             download_name="test_document_with_image_markers.docx",
         )
+
+    def test_document_markers_endpoint(self):
+        """Debug endpoint to check what markers are in a document"""
+        logger.info("Checking document for image markers")
+
+        # Check Content-Type
+        content_type = request.headers.get("Content-Type", "")
+        if not content_type.startswith("application/json"):
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "message": "Content-Type must be application/json",
+                    }
+                ),
+                415,
+            )
+
+        try:
+            # Get JSON data
+            data = request.get_json()
+            if not data:
+                return (
+                    jsonify(
+                        {
+                            "status": "error",
+                            "message": "Request body must be valid JSON",
+                        }
+                    ),
+                    400,
+                )
+
+            # Extract document content
+            doc_content = None
+            if "body" in data and isinstance(data["body"], dict):
+                if "$content" in data["body"]:
+                    doc_content = data["body"]["$content"]
+            elif "document" in data:
+                doc_content = data.get("document")
+
+            if not doc_content:
+                return (
+                    jsonify({"status": "error", "message": "Missing document content"}),
+                    400,
+                )
+
+            # Decode document
+            doc_bytes = base64.b64decode(doc_content)
+            doc = Document(io.BytesIO(doc_bytes))
+
+            # Find all image markers
+            markers_found = []
+            import re
+
+            image_pattern = re.compile(r"\{\{IMAGE:([^}]+)\}\}")
+
+            # Check all paragraphs
+            for para in doc.paragraphs:
+                text = para.text
+                matches = image_pattern.findall(text)
+                for match in matches:
+                    markers_found.append(
+                        {
+                            "marker": match,
+                            "full_marker": f"{{{{IMAGE:{match}}}}}",
+                            "paragraph": (
+                                text[:100] + "..." if len(text) > 100 else text
+                            ),
+                        }
+                    )
+
+            # Check tables
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for para in cell.paragraphs:
+                            text = para.text
+                            matches = image_pattern.findall(text)
+                            for match in matches:
+                                markers_found.append(
+                                    {
+                                        "marker": match,
+                                        "full_marker": f"{{{{IMAGE:{match}}}}}",
+                                        "in_table": True,
+                                        "paragraph": (
+                                            text[:100] + "..."
+                                            if len(text) > 100
+                                            else text
+                                        ),
+                                    }
+                                )
+
+            return (
+                jsonify(
+                    {
+                        "status": "success",
+                        "markers_found": markers_found,
+                        "total_markers": len(markers_found),
+                        "unique_markers": list(set(m["marker"] for m in markers_found)),
+                    }
+                ),
+                200,
+            )
+
+        except Exception as e:
+            logger.error(f"Error checking markers: {e}", exc_info=True)
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    def test_json_structure_endpoint(self):
+        """Test endpoint to verify JSON structure is being received correctly"""
+        logger.info("Testing JSON structure")
+
+        try:
+            # Get raw data first
+            raw_data = request.get_data(as_text=True)
+            logger.info(f"Raw data length: {len(raw_data)}")
+
+            # Try to parse JSON
+            data = request.get_json()
+
+            result = {
+                "status": "success",
+                "data_keys": list(data.keys()) if data else None,
+                "has_body": "body" in data if data else False,
+            }
+
+            if data and "body" in data:
+                body = data["body"]
+                result["body_keys"] = (
+                    list(body.keys()) if isinstance(body, dict) else "Not a dict"
+                )
+
+                if isinstance(body, dict) and "images" in body:
+                    images = body["images"]
+                    result["images_count"] = (
+                        len(images) if isinstance(images, list) else "Not a list"
+                    )
+                    if isinstance(images, list) and len(images) > 0:
+                        result["first_image_keys"] = (
+                            list(images[0].keys())
+                            if isinstance(images[0], dict)
+                            else "Not a dict"
+                        )
+                        result["image_markers"] = [
+                            img.get("marker", "NO MARKER")
+                            for img in images
+                            if isinstance(img, dict)
+                        ]
+
+            # Also check alternative structure
+            if data and "images" in data:
+                result["root_images_count"] = (
+                    len(data["images"])
+                    if isinstance(data["images"], list)
+                    else "Not a list"
+                )
+
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error testing JSON: {e}", exc_info=True)
+            return (
+                jsonify(
+                    {"status": "error", "message": str(e), "type": type(e).__name__}
+                ),
+                500,
+            )
 
     def create_test_document(self):
         """Create a test DOCX with formatting markers"""
@@ -1136,6 +1516,12 @@ class DOCXFormatterAPI:
                         "text-formatting",
                         "image-insertion",
                     ],  # Added image feature
+                    "endpoints": [
+                        "/format",
+                        "/format-download",
+                        "/format-with-images",
+                        "/format-with-images-download",  # NEW endpoint listed
+                    ],
                 }
             ),
             200,
