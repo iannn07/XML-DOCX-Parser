@@ -11,6 +11,9 @@ from docx import Document
 from docx.enum.text import WD_COLOR
 from lxml import etree
 
+# Import image handler - add this line to your imports
+from docx_image_handler import DOCXImageHandler
+
 # Configure logging
 log_level = os.environ.get("LOG_LEVEL", "INFO")
 logging.basicConfig(
@@ -656,6 +659,7 @@ class DOCXFormatterAPI:
     def __init__(self):
         self.app = Flask(__name__)
         self.formatter = DOCXFormatter()
+        self.image_handler = DOCXImageHandler()  # Add image handler
         self._setup_routes()
 
     def _setup_routes(self):
@@ -665,7 +669,13 @@ class DOCXFormatterAPI:
             self.format_download_endpoint
         )
         self.app.route("/format-xml", methods=["POST"])(self.format_xml_endpoint)
+        self.app.route("/format-with-images", methods=["POST"])(
+            self.format_with_images_endpoint
+        )  # New endpoint
         self.app.route("/test-doc", methods=["GET"])(self.create_test_document)
+        self.app.route("/test-images", methods=["GET"])(
+            self.test_images_endpoint
+        )  # New endpoint
         self.app.route("/test-format", methods=["GET"])(self.test_format_endpoint)
         self.app.route("/test-linebreaks", methods=["GET"])(
             self.test_linebreaks_endpoint
@@ -712,6 +722,64 @@ class DOCXFormatterAPI:
         except Exception as e:
             logger.error(f"Unexpected error: {e}", exc_info=True)
             return abort(500, "Internal server error during document processing")
+
+    def format_with_images_endpoint(self):
+        """Format document with images from AI response - NEW ENDPOINT"""
+        logger.info("Received formatting request with images")
+
+        try:
+            # Get JSON data from request
+            data = request.get_json()
+
+            if not data:
+                return abort(400, "Request must contain JSON data")
+
+            # Extract document and images
+            doc_content = data.get("document")
+            images = data.get("images", [])
+
+            if not doc_content:
+                return abort(400, "Missing 'document' field in request")
+
+            # Decode document content
+            if isinstance(doc_content, str):
+                doc_bytes = base64.b64decode(doc_content)
+            else:
+                doc_bytes = doc_content
+
+            # First, format the document for text markers
+            input_stream = io.BytesIO(doc_bytes)
+            formatted_stream = self.formatter.format_document(input_stream)
+            formatted_bytes = formatted_stream.read()
+
+            # Then, add images if any
+            if images:
+                logger.info(f"Processing {len(images)} images")
+                result_bytes = self.image_handler.add_images_to_docx(
+                    formatted_bytes, images
+                )
+            else:
+                result_bytes = formatted_bytes
+
+            # Return response
+            response_data = {
+                "status": "success",
+                "body": {
+                    "$content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "$content": base64.b64encode(result_bytes).decode("utf-8"),
+                },
+                "images_processed": len(images),
+            }
+
+            logger.info(f"Formatting completed with {len(images)} images")
+            return jsonify(response_data), 200
+
+        except ValueError as ve:
+            logger.error(f"Formatting error: {ve}")
+            return jsonify({"status": "error", "message": str(ve)}), 400
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return jsonify({"status": "error", "message": "Internal server error"}), 500
 
     def format_download_endpoint(self):
         """
@@ -802,6 +870,40 @@ class DOCXFormatterAPI:
     <message>{message}</message>
 </response>"""
         return xml_response, 400, {"Content-Type": "application/xml"}
+
+    def test_images_endpoint(self):
+        """Test endpoint to create a document with image markers - NEW ENDPOINT"""
+        doc = Document()
+
+        # Add title
+        doc.add_heading("Test Document with Image Markers", 0)
+
+        # Add paragraph with image marker
+        doc.add_paragraph("This is a test paragraph with an image below:")
+        doc.add_paragraph("{{IMAGE:test_image_1}}")
+        doc.add_paragraph("Text after the image marker.")
+
+        # Add another section
+        doc.add_heading("Section with Multiple Images", 1)
+        doc.add_paragraph("First image: {{IMAGE:chart_1}}")
+        doc.add_paragraph("Second image: {{IMAGE:diagram_1}}")
+
+        # Add combined markers
+        doc.add_paragraph(
+            "{{BOLD_START}}Bold text{{BOLD_END}} followed by {{IMAGE:inline_image}}"
+        )
+
+        # Save to stream
+        output = io.BytesIO()
+        doc.save(output)
+        output.seek(0)
+
+        return send_file(
+            output,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            as_attachment=True,
+            download_name="test_document_with_image_markers.docx",
+        )
 
     def create_test_document(self):
         """Create a test DOCX with formatting markers"""
@@ -1025,7 +1127,19 @@ class DOCXFormatterAPI:
 
     def health_check(self):
         """Health check endpoint"""
-        return jsonify({"status": "healthy", "service": "docx-formatter"}), 200
+        return (
+            jsonify(
+                {
+                    "status": "healthy",
+                    "service": "docx-formatter",
+                    "features": [
+                        "text-formatting",
+                        "image-insertion",
+                    ],  # Added image feature
+                }
+            ),
+            200,
+        )
 
     def _is_valid_content_type(self, content_type: str) -> bool:
         """Check if content type is valid for DOCX"""
@@ -1033,6 +1147,7 @@ class DOCXFormatterAPI:
             "application/octet-stream",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "multipart/form-data",  # For browser uploads
+            "application/json",  # For JSON requests with images
         ]
         return any(content_type.startswith(vt) for vt in valid_types)
 
